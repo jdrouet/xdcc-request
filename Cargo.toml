@@ -2,6 +2,7 @@
 name = "xdcc-request"
 description = "Requests XDCC files"
 authors = ["Jeremie Drouet <jeremie.drouet@gmail.com>"]
+readme = "readme.md"
 license = "MIT"
 version = "0.1.0"
 edition = "2024"
