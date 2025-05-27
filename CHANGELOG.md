@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.1](https://github.com/jdrouet/xdcc-request/compare/v0.1.0...v0.1.1) - 2025-05-27
+
+### Other
+
+- release v0.1.0 ([#1](https://github.com/jdrouet/xdcc-request/pull/1))
+
 ## [0.1.0](https://github.com/jdrouet/xdcc-request/releases/tag/v0.1.0) - 2025-05-27
 
 ### Added
