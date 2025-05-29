@@ -1,15 +1,18 @@
 #![doc = include_str!("../readme.md")]
 
-use std::net::{IpAddr, Ipv4Addr};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures_util::Stream;
-use irc::client::Client;
 use irc::client::data::Config;
+use irc::client::{Client, ClientStream};
 use irc::error::{Error, Result};
 use irc::proto::Message;
 use names::Generator;
+
+mod response;
+
+pub use response::Response;
 
 /// Internal engine state, shared across requests.
 struct InnerEngine {
@@ -17,6 +20,8 @@ struct InnerEngine {
     names: Mutex<Generator<'static>>,
     /// Timeout duration for IRC responses.
     timeout: Duration,
+    /// Number of times the file will be requested
+    retry_request: u8,
 }
 
 impl Default for InnerEngine {
@@ -24,6 +29,7 @@ impl Default for InnerEngine {
         Self {
             names: Default::default(),
             timeout: Duration::from_secs(30),
+            retry_request: 5,
         }
     }
 }
@@ -102,14 +108,22 @@ pub struct Request {
 /// Waits for the first private message from the IRC server.
 ///
 /// Returns `Ok(())` if a `PRIVMSG` is received, or an error if the stream ends or fails.
-async fn wait_for_first_private_message(
+async fn wait_for_init(
+    channel: &str,
     mut stream: impl Stream<Item = Result<Message>> + Unpin,
 ) -> Result<()> {
     use futures_util::StreamExt;
+    use irc::proto::Command;
 
     while let Some(message) = stream.next().await.transpose()? {
-        if matches!(message.command, irc::proto::Command::PRIVMSG(_, _)) {
-            return Ok(());
+        match message.command {
+            Command::JOIN(_, _, _) | Command::MOTD(_) => {
+                return Ok(());
+            }
+            Command::PRIVMSG(origin, _) if origin == channel => {
+                return Ok(());
+            }
+            _ => {}
         }
     }
 
@@ -125,7 +139,7 @@ async fn wait_for_dcc_response(
     use futures_util::StreamExt;
 
     while let Some(message) = stream.next().await.transpose()? {
-        let irc::proto::Command::PRIVMSG(_botname, cmd) = message.command else {
+        let irc::proto::Command::PRIVMSG(_, cmd) = message.command else {
             continue;
         };
         if let Some(res) = Response::decode(&cmd) {
@@ -137,6 +151,21 @@ async fn wait_for_dcc_response(
 }
 
 impl Request {
+    async fn send_request(
+        &self,
+        client: &mut Client,
+        stream: &mut ClientStream,
+    ) -> Result<Response> {
+        client.send_privmsg(
+            self.info.botname.as_str(),
+            format!("xdcc send #{}", self.info.packnum),
+        )?;
+
+        tokio::time::timeout(self.inner.timeout, wait_for_dcc_response(stream))
+            .await
+            .map_err(|_| Error::PingTimeout)?
+    }
+
     /// Executes the XDCC request by connecting to the IRC server,
     /// identifying, joining the channel, sending the XDCC command,
     /// and awaiting the DCC SEND response.
@@ -149,6 +178,7 @@ impl Request {
             nickname: self.inner.next_name(),
             server: Some(self.info.server.clone()),
             channels: vec![self.info.channel.clone()],
+            use_tls: Some(true),
             ..Default::default()
         };
 
@@ -156,63 +186,34 @@ impl Request {
         client.identify()?;
 
         let mut stream = client.stream()?;
+
         tokio::time::timeout(
             self.inner.timeout,
-            wait_for_first_private_message(&mut stream),
+            wait_for_init(&self.info.channel, &mut stream),
         )
         .await
         .map_err(|_| Error::PingTimeout)??;
 
-        client.send_privmsg(
-            self.info.botname.as_str(),
-            format!("xdcc send #{}", self.info.packnum),
-        )?;
-
-        tokio::time::timeout(self.inner.timeout, wait_for_dcc_response(&mut stream))
-            .await
-            .map_err(|_| Error::PingTimeout)?
-    }
-}
-
-/// Represents a parsed DCC SEND response from the IRC bot.
-#[derive(Clone, Debug)]
-pub struct Response {
-    /// The name of the file being sent.
-    pub filename: String,
-    /// IP address of the sender.
-    pub address: IpAddr,
-    /// Port number used for the DCC transfer.
-    pub port: u16,
-    /// Size of the file in bytes.
-    pub filesize: u64,
-}
-
-impl Response {
-    /// Decodes a `DCC SEND` command message into a `Response`.
-    ///
-    /// Returns `Some(Response)` if decoding is successful, or `None` if parsing fails.
-    pub fn decode(msg: &str) -> Option<Self> {
-        let msg = msg.trim().strip_prefix("DCC SEND ")?;
-
-        let (msg, filesize) = msg.rsplit_once(" ")?;
-        let filesize = filesize.parse::<u64>().ok()?;
-
-        let (msg, port) = msg.rsplit_once(" ")?;
-        let port = port.parse::<u16>().ok()?;
-
-        let (msg, ip) = msg.rsplit_once(" ")?;
-        let ip = ip.parse::<u32>().ok()?;
-        let ip = Ipv4Addr::from(ip);
-
-        let filename = msg.trim_matches('"');
-        let filename = filename.replace("\\\"", "\"");
-
-        Some(Self {
-            filename,
-            address: IpAddr::V4(ip),
-            port,
-            filesize,
-        })
+        let mut index: u8 = 0;
+        loop {
+            match self.send_request(&mut client, &mut stream).await {
+                Ok(res) if res.port == 0 => {
+                    return Err(Error::Io(std::io::Error::new(
+                        std::io::ErrorKind::Unsupported,
+                        "unsupported DCC response",
+                    )));
+                }
+                Ok(res) => {
+                    return Ok(res);
+                }
+                Err(err) => {
+                    if index >= self.inner.retry_request {
+                        return Err(err);
+                    }
+                    index += 1;
+                }
+            }
+        }
     }
 }
 
@@ -249,9 +250,7 @@ mod tests {
                 command: Command::PRIVMSG("botname".into(), "hello world".into()),
             }),
         ]);
-        super::wait_for_first_private_message(&mut stream)
-            .await
-            .unwrap();
+        super::wait_for_init("botname", &mut stream).await.unwrap();
     }
 
     #[tokio::test]
@@ -261,18 +260,6 @@ mod tests {
             prefix: None,
             command: Command::PING(Default::default(), Default::default()),
         })]);
-        super::wait_for_first_private_message(&mut stream)
-            .await
-            .unwrap_err();
-    }
-
-    #[test_case::test_case("DCC SEND \"foo.txt\" 3232235777 5000 1048576", "foo.txt", 5000, 1048576; "simple")]
-    #[test_case::test_case("DCC SEND \"hello\\\"world.txt\" 3232235777 5000 1048576", "hello\"world.txt", 5000, 1048576; "with quotes")]
-    #[test_case::test_case("DCC SEND \"foo bar baz.txt\" 3232235777 5000 1048576", "foo bar baz.txt", 5000, 1048576; "filename with spaces")]
-    fn should_decode_dcc_msg(msg: &str, fname: &str, port: u16, size: u64) {
-        let res = super::Response::decode(msg).unwrap();
-        assert_eq!(res.filename, fname);
-        assert_eq!(res.port, port);
-        assert_eq!(res.filesize, size);
+        super::wait_for_init("", &mut stream).await.unwrap_err();
     }
 }
