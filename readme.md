@@ -28,7 +28,7 @@ tokio = { version = "1", features = ["full"] }
 ````
 
 ```rust
-use xdcc_request::Engine;
+use xdcc_request::engine::Engine;
 
 #[tokio::main]
 async fn main() {
